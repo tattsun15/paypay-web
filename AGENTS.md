@@ -54,18 +54,40 @@ Botのユーザー向けコマンド（例：`/paypay` スラッシュコマン�
 from paypay_web import PayPay
 from receive_with_hold_async import receive_with_hold
 
-async def receive_paypay_link(url: str, passcode: str | None = None) -> str:
+async def receive_paypay_link(url: str, passcode: str | None = None, on_hold=None) -> str:
     client = PayPay.load("paypay.json")
     if client is None:
         return "LOGIN"
     await asyncio.to_thread(client.ensure_alive)  # 期限が切れていたら自動で入り直し
     client.save("paypay.json")
-    result = await receive_with_hold(client, url, passcode=passcode)
+    result = await receive_with_hold(client, url, passcode=passcode, on_hold=on_hold)
     client.save("paypay.json")  # クッキーが更新されたかもしれない
     return result  # "RECEIVED" / "GONE" / "FAILED" / "LOGIN"
 ```
 
 既存のコードが同期なら `receive_with_hold.py` の方を使う。
+
+## 4.5. 保留中の案内（必ず実装する）
+
+`receive_with_hold` は、保留になると最大40分待ってから結果を返す。その間お客さんに何も出ないと「止まった」と思われるので、**`on_hold` で保留中の案内を出す**。`on_hold` は保留に入ったときに1回だけ呼ばれる（引数は `LinkInfo`。リンクを読めなかったときは `None`）。
+
+保留になるのは：
+- 受け取りの応答が消えた（受け取れたか分からない）
+- PayPay側の「一時保留」（コード `42007013`）で断られた。`receive_with_hold` が1分ごとに受け取りをやり直す
+
+案内の例（Botの既存の文面・見た目があればそれに合わせる）：
+
+> **決済が保留中です**
+> PayPay側で決済が一時保留になっています。確認が取れしだい自動でお渡しします（最大40分）。
+> 送金リンクは作り直さず、このままお待ちください。
+
+実装のしかた：
+- 案内は**購入した画面（元のメッセージ）とDMの両方**に出す。DMが閉じられていても画面で見えるように
+- **保留のあとの最終結果は、新しいメッセージかDMで送る**。Discordのボタン・コマンドへの返信（interaction の followup / edit）は15分で期限が切れるので、40分後には使えない。チャンネルへの通常の `channel.send` か `user.send` を使う
+- 保留中は在庫を確保したままにする（他の人に同じ商品を売らない）。既存に在庫の確保・解放の仕組みがあればそれを使う
+- 管理者にも「保留が発生した（お客さん・商品・金額）」と通知しておくと、FAILED になったときに追いやすい
+
+制限（ユーザーに伝える）：保留を待っている途中でBotを再起動すると、その保留の続きは追えない。再起動のあとは管理者が手で確認する必要がある。再起動をまたいで見張り直したいときは、保留中の注文（リンク・お客さん・商品）をファイルかDBに残し、起動時にもう一度 `receive_with_hold` を呼ぶ仕組みを別に作る。
 
 ## 5. 返り値ごとの処理
 
@@ -97,20 +119,7 @@ Botが複数のPayPayアカウントを使い分ける場合（アカウント�
 
 **受け取り時**：既存のBotがどのアカウントで受け取るか決めるロジック（例：「このチャンネルはこのアカウント」「このユーザーの購入はこのアカウント」）はそのまま残す。決まったアカウントの `paypay.json` を読み込んで、`receive_with_hold` を呼ぶ：
 
-```python
-async def receive_paypay_link(account_name: str, url: str, passcode: str | None = None) -> str:
-    path = f"paypay_accounts/{account_name}.json"
-    client = PayPay.load(path)
-    if client is None:
-        return "LOGIN"
-    await asyncio.to_thread(client.ensure_alive)
-    client.save(path)
-    result = await receive_with_hold(client, url, passcode=passcode)
-    client.save(path)
-    return result
-```
-
-**同時受け取り**：**同じ `paypay.json` を2つの処理が同時に使うのは避ける**こと。クッキーが競合して無効化されることがある。アカウントごとに `asyncio.Lock` を1つ持って、そのアカウントで受け取り処理が走っている間は他をブロックする：
+**同時受け取り**：同じアカウントで2つの処理が同時に**入り直し（`ensure_alive`）や保存**をすると、入り直しが二重に走ったり、保存が上書きし合ったりする。アカウントごとに `asyncio.Lock` を1つ持って、**入り直しと保存のときだけ**ロックする。**受け取り（`receive_with_hold`）の間はロックしない**こと。保留になると最大40分かかるので、ロックしたまま待つとそのアカウントの他の購入が全部止まる。
 
 ```python
 _account_locks: dict[str, asyncio.Lock] = {}
@@ -120,9 +129,18 @@ def _lock_for(account: str) -> asyncio.Lock:
         _account_locks[account] = asyncio.Lock()
     return _account_locks[account]
 
-async def receive_paypay_link(account: str, url: str, ...) -> str:
+async def receive_paypay_link(account: str, url: str, passcode: str | None = None, on_hold=None) -> str:
+    path = f"paypay_accounts/{account}.json"
     async with _lock_for(account):
-        ...  # 上の処理
+        client = PayPay.load(path)
+        if client is None:
+            return "LOGIN"
+        await asyncio.to_thread(client.ensure_alive)
+        client.save(path)
+    result = await receive_with_hold(client, url, passcode=passcode, on_hold=on_hold)
+    async with _lock_for(account):
+        client.save(path)
+    return result
 ```
 
 **気をつけること**：
@@ -148,10 +166,12 @@ async def receive_paypay_link(account: str, url: str, ...) -> str:
 
 ## 補足：なぜ保留対処が必要か
 
-`link_receive` の応答がネットワーク都合で消えると、「受け取れた」のか「失敗した」のか分かりません。
-- 失敗扱いにすると、本当は受け取ったお金を無かったことにしてしまう
+`link_receive` の応答がネットワーク都合で消えると、「受け取れた」のか「失敗した」のか分かりません。また PayPay 側が「一時保留」（`42007013`）で受け取りを断ることがあり、これは少し待つと受け取れます。
+- 失敗扱いにすると、本当は受け取れたお金を取り逃がす
 - 成功扱いにすると、受け取っていないのに商品を渡してしまう
 
-`receive_with_hold` は、この「分からない」状態を保留にして、2つの手段で判定します：
+`receive_with_hold` は、これらを保留にして、次の順で判定します（15秒ごと、最大40分）：
 1. `link_check` の応答に含まれる `receiver.isReceiver` ← 2026-10から入った新項目。1回の通信で判定
-2. 取引履歴から `orderId` と金額で照合 ← 遅いが確実
+2. リンクがまだ受け取り待ちなら、1分ごとに受け取りをやり直す（一時保留が解けるのを待つ）
+3. 取引履歴から `orderId` と金額で照合 ← 遅いが確実
+4. リンクがキャンセル・期限切れになったら `GONE`

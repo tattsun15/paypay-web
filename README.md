@@ -78,23 +78,35 @@ client.save("paypay.json")
 | 送金リンクの受け取り | `link_receive(url_or_code, passcode=None, info=None)` |
 | 自分が受け取ったか（isReceiver） | `paypay_web.is_link_received_by_me(info.raw)` |
 | リンクが終了状態か | `paypay_web.is_link_dead(info.raw)` |
+| リンクがまだ受け取り待ちか | `paypay_web.is_link_pending(info.raw)` |
+| PayPayの一時保留（42007013）か | `paypay_web.is_temp_hold(exc)` |
 | 履歴から受け取り完了を探す | `paypay_web.find_receive_in_history(history, order_id, amount)` |
-| 保留対処つきの受け取り（お手本） | `receive_with_hold.py` の `receive_with_hold(client, url)` |
+| 保留対処つきの受け取り（お手本） | `receive_with_hold(client, url, passcode=None, on_hold=None)`（`receive_with_hold.py` / 非同期は `receive_with_hold_async.py`） |
 
 ## 自販機・代行Bot向け：保留対処のパターン
 
-`link_receive` を呼んだ応答がタイムアウトすると、「お金を受け取れたのか失敗したのか」が分かりません。
-そのまま失敗扱いにするとお金を取り逃がし、成功扱いにすると商品を無料で渡してしまいます。
-→ **保留にして、あとから確実に判定する**のが正解です。
+保留になるのは2つの場合です。
+- `link_receive` の応答がタイムアウトして、「お金を受け取れたのか失敗したのか」が分からない
+- PayPay 側が「一時保留」（`42007013`）で受け取りを断った。少し待つと受け取れる
 
-判定は速くて確実な順でやります。
+そのまま失敗扱いにするとお金を取り逃がし、成功扱いにすると商品を無料で渡してしまいます。
+→ **保留にして、あとから確実に判定する**のが正解です。`receive_with_hold` は15秒ごと・最大40分、次の順で判定します。
 
 1. `is_link_received_by_me(info.raw)` ← `link_check` の応答に入った `receiver.isReceiver` を見るだけ。1回の通信で済む
-2. `find_receive_in_history(history, order_id, amount)` ← 取引履歴から orderId + 金額 で探す。遅いが確実
-3. `is_link_dead(info.raw)` ← CANCELED / EXPIRED / REJECTED になっていたら諦めて「失敗」
+2. `is_link_pending(info.raw)` ← まだ受け取り待ちなら、1分ごとに受け取りをやり直す（一時保留が解けるのを待つ）
+3. `find_receive_in_history(history, order_id, amount)` ← 取引履歴から orderId + 金額 で探す。遅いが確実
+4. `is_link_dead(info.raw)` ← CANCELED / EXPIRED / REJECTED になっていたら `GONE`
 
-全部まとめた使えるコードが `receive_with_hold.py` にあります。Botに組み込むならこれをコピーして、
-`time.sleep` を `asyncio.sleep` に変えるだけで非同期にもできます。
+保留中は最大40分かかるので、お客さんに案内を出してください。`on_hold` は保留に入ったときに1回だけ呼ばれます（引数は `LinkInfo`、読めなかったときは `None`）。
+
+```python
+async def show_hold(info):
+    await user.send("決済が保留中です。確認が取れしだい自動でお渡しします（最大40分）")
+
+result = await receive_with_hold(client, url, on_hold=show_hold)
+```
+
+Discordのボタン・コマンドへの返信は15分で期限が切れるので、保留のあとの結果は新しいメッセージかDMで送ってください。
 
 ## 分かっていること
 

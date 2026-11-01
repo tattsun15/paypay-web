@@ -96,6 +96,21 @@ def is_link_received_by_me(raw: Any) -> bool:
     return bool(states & LINK_RECEIVED_STATES) and not (states & LINK_DEAD_STATES)
 
 
+def is_link_pending(raw: Any) -> bool:
+    """リンクがまだ受け取り待ち（PENDING）か？保留中に受け取りをやり直すか決めるのに使う。"""
+    return _is_pending_link(raw)
+
+
+TEMP_HOLD_CODE = "42007013"
+
+
+def is_temp_hold(exc: BaseException) -> bool:
+    """PayPay側の「一時保留」（42007013）で断られたか？
+    これは失敗ではなく保留。少し待つと受け取れるようになるので、受け取りをやり直す。"""
+    text = str(exc).lower()
+    return TEMP_HOLD_CODE in text or "half sheet" in text
+
+
 def _flat(entry: Any, paths: list[str]) -> list:
     out = []
     for path in paths:
